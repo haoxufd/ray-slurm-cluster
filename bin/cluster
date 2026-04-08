@@ -1,0 +1,165 @@
+#!/bin/bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CONFIG_PATH="${CLUSTER_CONFIG:-$REPO_ROOT/config/cluster.env}"
+STATE_HELPER="$REPO_ROOT/scripts/cluster_state.py"
+SLURM_JOB_SCRIPT="$REPO_ROOT/slurm/ray_node_job.sh"
+
+usage() {
+    cat <<'EOF'
+Usage:
+  bin/cluster up <num_nodes> <partition>
+  bin/cluster status <cluster_id>
+  bin/cluster down <cluster_id>
+EOF
+}
+
+require_config() {
+    if [[ ! -f "$CONFIG_PATH" ]]; then
+        echo "config file not found: $CONFIG_PATH" >&2
+        exit 1
+    fi
+    # shellcheck disable=SC1090
+    source "$CONFIG_PATH"
+}
+
+require_common_paths() {
+    if [[ ! -f "$SIF_PATH" ]]; then
+        echo "SIF file not found: $SIF_PATH" >&2
+        exit 1
+    fi
+    mkdir -p "$STATE_ROOT" "$LOG_ROOT"
+}
+
+select_gpu_config() {
+    local partition=$1
+    if [[ "$partition" == *h100* ]]; then
+        GPUS_PER_NODE="$H100_GPUS_PER_NODE"
+        CONSTRAINT_ARGS=()
+        if [[ -n "${H100_CONSTRAINT:-}" ]]; then
+            CONSTRAINT_ARGS=(--constraint="$H100_CONSTRAINT")
+        fi
+    else
+        GPUS_PER_NODE="$A100_GPUS_PER_NODE"
+        CONSTRAINT_ARGS=()
+        if [[ -n "${A100_CONSTRAINT:-}" ]]; then
+            CONSTRAINT_ARGS=(--constraint="$A100_CONSTRAINT")
+        fi
+    fi
+}
+
+generate_cluster_id() {
+    python3 - <<'PY'
+import random
+import string
+import time
+
+suffix = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(4))
+print(time.strftime("%Y%m%d-%H%M%S") + "-" + suffix)
+PY
+}
+
+cmd_up() {
+    if [[ $# -ne 2 ]]; then
+        usage
+        exit 1
+    fi
+
+    local num_nodes=$1
+    local partition=$2
+
+    if ! [[ "$num_nodes" =~ ^[1-9][0-9]*$ ]]; then
+        echo "num_nodes must be a positive integer" >&2
+        exit 1
+    fi
+
+    require_config
+    require_common_paths
+    select_gpu_config "$partition"
+
+    local cluster_id
+    cluster_id="$(generate_cluster_id)"
+
+    python3 "$STATE_HELPER" init \
+        --state-root "$STATE_ROOT" \
+        --cluster-id "$cluster_id" \
+        --num-nodes "$num_nodes"
+
+    local job_id
+    local log_path
+    for _ in $(seq 1 "$num_nodes"); do
+        log_path="$LOG_ROOT/job_%j.out"
+        job_id="$(sbatch --parsable \
+            --job-name="ray-node-$cluster_id" \
+            --partition="$partition" \
+            --gpus-per-node="$GPUS_PER_NODE" \
+            "${CONSTRAINT_ARGS[@]}" \
+            -t "$SLURM_TIME_LIMIT" \
+            -N 1 \
+            --ntasks=1 \
+            --output="$log_path" \
+            --exclusive \
+            --export=ALL,CLUSTER_ID="$cluster_id",STATE_ROOT="$STATE_ROOT",SIF_PATH="$SIF_PATH",DATA_STORAGE_PATH="$DATA_STORAGE_PATH",RAY_PORT="$RAY_PORT",REPO_ROOT="$REPO_ROOT" \
+            "$SLURM_JOB_SCRIPT")"
+        python3 "$STATE_HELPER" add-job \
+            --state-root "$STATE_ROOT" \
+            --cluster-id "$cluster_id" \
+            --job-id "$job_id"
+    done
+
+    echo "cluster_id=$cluster_id"
+}
+
+cmd_status() {
+    if [[ $# -ne 1 ]]; then
+        usage
+        exit 1
+    fi
+    require_config
+    python3 "$STATE_HELPER" status \
+        --state-root "$STATE_ROOT" \
+        --cluster-id "$1"
+}
+
+cmd_down() {
+    if [[ $# -ne 1 ]]; then
+        usage
+        exit 1
+    fi
+    require_config
+
+    local cluster_id=$1
+    local jobs_file="$STATE_ROOT/$cluster_id/jobs.txt"
+    if [[ -f "$jobs_file" ]]; then
+        while read -r job_id; do
+            [[ -n "$job_id" ]] || continue
+            scancel "$job_id"
+        done < "$jobs_file"
+    fi
+    python3 "$STATE_HELPER" cleanup \
+        --state-root "$STATE_ROOT" \
+        --cluster-id "$cluster_id"
+}
+
+main() {
+    if [[ $# -lt 1 ]]; then
+        usage
+        exit 1
+    fi
+
+    local command=$1
+    shift
+
+    case "$command" in
+        up) cmd_up "$@" ;;
+        status) cmd_status "$@" ;;
+        down) cmd_down "$@" ;;
+        *)
+            usage
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
