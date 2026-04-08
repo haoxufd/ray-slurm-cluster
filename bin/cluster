@@ -10,6 +10,7 @@ usage() {
     cat <<'EOF'
 Usage:
   bin/cluster up <num_nodes> <partition> [--email <addr>]
+  bin/cluster scale <cluster_id> <add_nodes>
   bin/cluster status <cluster_id>
   bin/cluster down <cluster_id>
 EOF
@@ -60,6 +61,37 @@ print(time.strftime("%Y%m%d-%H%M%S") + "-" + suffix)
 PY
 }
 
+submit_nodes() {
+    local cluster_id=$1
+    local partition=$2
+    local num_nodes=$3
+    local notify_email=$4
+
+    select_gpu_config "$partition"
+
+    local job_id
+    local log_path
+    for _ in $(seq 1 "$num_nodes"); do
+        log_path="$LOG_ROOT/job_%j.out"
+        job_id="$(sbatch --parsable \
+            --job-name="ray-node-$cluster_id" \
+            --partition="$partition" \
+            --gpus-per-node="$GPUS_PER_NODE" \
+            "${CONSTRAINT_ARGS[@]}" \
+            -t "$SLURM_TIME_LIMIT" \
+            -N 1 \
+            --ntasks=1 \
+            --output="$log_path" \
+            --exclusive \
+            --export=ALL,CLUSTER_ID="$cluster_id",STATE_ROOT="$STATE_ROOT",SIF_PATH="$SIF_PATH",DATA_STORAGE_PATH="$DATA_STORAGE_PATH",RAY_PORT="$RAY_PORT",REPO_ROOT="$REPO_ROOT",PARTITION_NAME="$partition",NOTIFY_EMAIL="$notify_email" \
+            "$SLURM_JOB_SCRIPT")"
+        python3 "$STATE_HELPER" add-job \
+            --state-root "$STATE_ROOT" \
+            --cluster-id "$cluster_id" \
+            --job-id "$job_id"
+    done
+}
+
 cmd_up() {
     if [[ $# -lt 2 || $# -gt 4 ]]; then
         usage
@@ -85,8 +117,6 @@ cmd_up() {
 
     require_config
     require_common_paths
-    select_gpu_config "$partition"
-
     local cluster_id
     cluster_id="$(generate_cluster_id)"
     local effective_notify_email="${cli_notify_email:-${NOTIFY_EMAIL:-}}"
@@ -98,29 +128,58 @@ cmd_up() {
         --partition "$partition" \
         --notify-email "$effective_notify_email"
 
-    local job_id
-    local log_path
-    for _ in $(seq 1 "$num_nodes"); do
-        log_path="$LOG_ROOT/job_%j.out"
-        job_id="$(sbatch --parsable \
-            --job-name="ray-node-$cluster_id" \
-            --partition="$partition" \
-            --gpus-per-node="$GPUS_PER_NODE" \
-            "${CONSTRAINT_ARGS[@]}" \
-            -t "$SLURM_TIME_LIMIT" \
-            -N 1 \
-            --ntasks=1 \
-            --output="$log_path" \
-            --exclusive \
-            --export=ALL,CLUSTER_ID="$cluster_id",STATE_ROOT="$STATE_ROOT",SIF_PATH="$SIF_PATH",DATA_STORAGE_PATH="$DATA_STORAGE_PATH",RAY_PORT="$RAY_PORT",REPO_ROOT="$REPO_ROOT",PARTITION_NAME="$partition",NOTIFY_EMAIL="$effective_notify_email" \
-            "$SLURM_JOB_SCRIPT")"
-        python3 "$STATE_HELPER" add-job \
-            --state-root "$STATE_ROOT" \
-            --cluster-id "$cluster_id" \
-            --job-id "$job_id"
-    done
+    submit_nodes "$cluster_id" "$partition" "$num_nodes" "$effective_notify_email"
 
     echo "cluster_id=$cluster_id"
+}
+
+cmd_scale() {
+    if [[ $# -ne 2 ]]; then
+        usage
+        exit 1
+    fi
+
+    local cluster_id=$1
+    local add_nodes=$2
+
+    if ! [[ "$add_nodes" =~ ^[1-9][0-9]*$ ]]; then
+        echo "add_nodes must be a positive integer" >&2
+        exit 1
+    fi
+
+    require_config
+    require_common_paths
+
+    local cluster_dir="$STATE_ROOT/$cluster_id"
+    local cluster_env="$cluster_dir/cluster.env"
+    if [[ ! -f "$cluster_env" ]]; then
+        echo "cluster config not found: $cluster_env" >&2
+        exit 1
+    fi
+
+    local partition=""
+    local notify_email=""
+    while IFS='=' read -r key value; do
+        case "$key" in
+            PARTITION) partition=$value ;;
+            NOTIFY_EMAIL) notify_email=$value ;;
+        esac
+    done < "$cluster_env"
+
+    if [[ -z "$partition" ]]; then
+        echo "partition missing in cluster config: $cluster_env" >&2
+        exit 1
+    fi
+
+    python3 "$STATE_HELPER" update-desired-nodes \
+        --state-root "$STATE_ROOT" \
+        --cluster-id "$cluster_id" \
+        --add-nodes "$add_nodes"
+
+    submit_nodes "$cluster_id" "$partition" "$add_nodes" "$notify_email"
+
+    echo "cluster_id=$cluster_id"
+    echo "added_nodes=$add_nodes"
 }
 
 cmd_status() {
@@ -165,6 +224,7 @@ main() {
 
     case "$command" in
         up) cmd_up "$@" ;;
+        scale) cmd_scale "$@" ;;
         status) cmd_status "$@" ;;
         down) cmd_down "$@" ;;
         *)

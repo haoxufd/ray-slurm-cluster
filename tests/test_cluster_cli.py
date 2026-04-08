@@ -129,6 +129,24 @@ printf '%s\n' "$1" >> "${FAKE_SLURM_ROOT}/scancel.log"
         cluster_env = (self.state_root / cluster_id / "cluster.env").read_text(encoding="utf-8")
         self.assertIn("NOTIFY_EMAIL=user@example.com", cluster_env)
 
+    def test_scale_updates_desired_nodes_and_submits_more_jobs(self):
+        self.write_config()
+
+        up = self.run_cmd("up", "2", "a100q", "--email", "user@example.com")
+        cluster_id = up.stdout.strip().split("cluster_id=")[1].splitlines()[0]
+
+        result = self.run_cmd("scale", cluster_id, "3")
+
+        self.assertIn(f"cluster_id={cluster_id}", result.stdout)
+        self.assertIn("added_nodes=3", result.stdout)
+        cluster_dir = self.state_root / cluster_id
+        jobs = (cluster_dir / "jobs.txt").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(jobs, ["1000", "1001", "1002", "1003", "1004"])
+        self.assertEqual((cluster_dir / "desired_nodes").read_text(encoding="utf-8").strip(), "5")
+        cluster_env = (cluster_dir / "cluster.env").read_text(encoding="utf-8")
+        self.assertIn("PARTITION=a100q", cluster_env)
+        self.assertIn("NOTIFY_EMAIL=user@example.com", cluster_env)
+
 
 if __name__ == "__main__":
     unittest.main()

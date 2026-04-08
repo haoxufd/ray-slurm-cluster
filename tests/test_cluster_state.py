@@ -331,6 +331,34 @@ class ClusterStateCliTest(unittest.TestCase):
         self.assertIn("ip=10.0.0.1", log_text)
         self.assertIn("partition=a100q", log_text)
 
+    def test_update_desired_nodes_increases_target_size(self):
+        self.run_cmd(
+            "init",
+            "--state-root",
+            str(self.state_root),
+            "--cluster-id",
+            self.cluster_id,
+            "--num-nodes",
+            "2",
+            "--partition",
+            "a100q",
+            "--notify-email",
+            "user@example.com",
+        )
+
+        self.run_cmd(
+            "update-desired-nodes",
+            "--state-root",
+            str(self.state_root),
+            "--cluster-id",
+            self.cluster_id,
+            "--add-nodes",
+            "3",
+        )
+
+        cluster_dir = self.state_root / self.cluster_id
+        self.assertEqual((cluster_dir / "desired_nodes").read_text(encoding="utf-8").strip(), "5")
+
 
 if __name__ == "__main__":
     unittest.main()

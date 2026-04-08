@@ -110,6 +110,16 @@ def cmd_maybe_mark_ready(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_update_desired_nodes(args: argparse.Namespace) -> int:
+    root = require_cluster(args.state_root, args.cluster_id)
+    desired_path = root / "desired_nodes"
+    current = int(desired_path.read_text(encoding="utf-8").strip())
+    desired_path.write_text(f"{current + args.add_nodes}\n", encoding="utf-8")
+    if (root / "ready").exists():
+        (root / "ready").unlink()
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     root = require_cluster(args.state_root, args.cluster_id)
     jobs = (root / "jobs.txt").read_text(encoding="utf-8").splitlines()
@@ -241,6 +251,12 @@ def build_parser() -> argparse.ArgumentParser:
     maybe_ready_parser.add_argument("--state-root", required=True)
     maybe_ready_parser.add_argument("--cluster-id", required=True)
     maybe_ready_parser.set_defaults(func=cmd_maybe_mark_ready)
+
+    update_desired_parser = subparsers.add_parser("update-desired-nodes")
+    update_desired_parser.add_argument("--state-root", required=True)
+    update_desired_parser.add_argument("--cluster-id", required=True)
+    update_desired_parser.add_argument("--add-nodes", type=int, required=True)
+    update_desired_parser.set_defaults(func=cmd_update_desired_nodes)
 
     status_parser = subparsers.add_parser("status")
     status_parser.add_argument("--state-root", required=True)

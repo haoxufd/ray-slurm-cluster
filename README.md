@@ -26,11 +26,13 @@ Edit `config/cluster.env`:
 ```bash
 bin/cluster up 8 ai4science_h100
 bin/cluster up 8 ai4science_h100 --email you@example.com
+bin/cluster scale <cluster_id> 4
 bin/cluster status <cluster_id>
 bin/cluster down <cluster_id>
 ```
 
 `up` returns immediately after submission. Use `squeue --me` to watch scheduling progress.
+`scale` reuses the existing cluster's partition and notification settings, increases `desired_nodes`, and submits additional one-node jobs that join the current Ray cluster as workers.
 If `NOTIFY_EMAIL` is set in config, or `--email` is provided, each node sends one notification email after successful registration by calling the local `mail` command.
 
 ## Shared State
