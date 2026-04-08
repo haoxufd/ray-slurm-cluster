@@ -17,6 +17,7 @@ Edit `config/cluster.env`:
 - `STATE_ROOT`: shared filesystem path for cluster state
 - `DATA_STORAGE_PATH`: bind-mounted shared data path
 - `LOG_ROOT`: Slurm output directory
+- `NOTIFY_EMAIL`: default registration notification email, optional
 - `RAY_PORT`: Ray head port
 - `SLURM_TIME_LIMIT`: job walltime
 
@@ -24,11 +25,13 @@ Edit `config/cluster.env`:
 
 ```bash
 bin/cluster up 8 ai4science_h100
+bin/cluster up 8 ai4science_h100 --email you@example.com
 bin/cluster status <cluster_id>
 bin/cluster down <cluster_id>
 ```
 
 `up` returns immediately after submission. Use `squeue --me` to watch scheduling progress.
+If `NOTIFY_EMAIL` is set in config, or `--email` is provided, each node sends one notification email after successful registration by calling the local `mail` command.
 
 ## Shared State
 

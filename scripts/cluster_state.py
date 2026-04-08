@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -32,6 +33,13 @@ def cmd_init(args: argparse.Namespace) -> int:
     (root / "workers").mkdir()
     (root / "desired_nodes").write_text(f"{args.num_nodes}\n")
     (root / "jobs.txt").write_text("")
+    notify_email = args.notify_email or ""
+    cluster_env_lines = [
+        f"CLUSTER_ID={args.cluster_id}",
+        f"PARTITION={args.partition}",
+        f"NOTIFY_EMAIL={notify_email}",
+    ]
+    (root / "cluster.env").write_text("\n".join(cluster_env_lines) + "\n", encoding="utf-8")
     return 0
 
 
@@ -147,6 +155,37 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_notify_node_registered(args: argparse.Namespace) -> int:
+    if not args.email:
+        return 0
+
+    subject = f"[ray-slurm-cluster] node registered for {args.cluster_id}"
+    body_lines = [
+        f"cluster_id={args.cluster_id}",
+        f"job_id={args.job_id}",
+        f"hostname={args.hostname}",
+        f"ip={args.ip}",
+        f"partition={args.partition}",
+        f"timestamp={time.strftime('%Y-%m-%d %H:%M:%S %Z')}",
+    ]
+    body = "\n".join(body_lines) + "\n"
+
+    try:
+        subprocess.run(
+            ["mail", "-s", subject, args.email],
+            input=body,
+            text=True,
+            check=True,
+        )
+    except FileNotFoundError as exc:
+        print(f"mail command not found: {exc}", file=sys.stderr)
+        return 1
+    except subprocess.CalledProcessError as exc:
+        print(f"mail command failed with exit code {exc.returncode}", file=sys.stderr)
+        return exc.returncode
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -155,6 +194,8 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser.add_argument("--state-root", required=True)
     init_parser.add_argument("--cluster-id", required=True)
     init_parser.add_argument("--num-nodes", type=int, required=True)
+    init_parser.add_argument("--partition", required=True)
+    init_parser.add_argument("--notify-email", default="")
     init_parser.set_defaults(func=cmd_init)
 
     add_job_parser = subparsers.add_parser("add-job")
@@ -210,6 +251,15 @@ def build_parser() -> argparse.ArgumentParser:
     cleanup_parser.add_argument("--state-root", required=True)
     cleanup_parser.add_argument("--cluster-id", required=True)
     cleanup_parser.set_defaults(func=cmd_cleanup)
+
+    notify_parser = subparsers.add_parser("notify-node-registered")
+    notify_parser.add_argument("--email", default="")
+    notify_parser.add_argument("--cluster-id", required=True)
+    notify_parser.add_argument("--job-id", required=True)
+    notify_parser.add_argument("--hostname", required=True)
+    notify_parser.add_argument("--ip", required=True)
+    notify_parser.add_argument("--partition", required=True)
+    notify_parser.set_defaults(func=cmd_notify_node_registered)
 
     return parser
 

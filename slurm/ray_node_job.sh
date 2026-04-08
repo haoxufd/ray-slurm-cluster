@@ -7,7 +7,7 @@ fi
 
 STATE_HELPER="$REPO_ROOT/scripts/cluster_state.py"
 
-if [[ -z "${CLUSTER_ID:-}" || -z "${STATE_ROOT:-}" || -z "${SIF_PATH:-}" || -z "${DATA_STORAGE_PATH:-}" || -z "${RAY_PORT:-}" ]]; then
+if [[ -z "${CLUSTER_ID:-}" || -z "${STATE_ROOT:-}" || -z "${SIF_PATH:-}" || -z "${DATA_STORAGE_PATH:-}" || -z "${RAY_PORT:-}" || -z "${PARTITION_NAME:-}" ]]; then
     echo "missing required environment variables" >&2
     exit 1
 fi
@@ -21,6 +21,16 @@ python3 "$STATE_HELPER" register-node \
     --job-id "$SLURM_JOB_ID" \
     --hostname "$HOSTNAME_VALUE" \
     --ip "$IP_VALUE"
+
+if [[ -n "${NOTIFY_EMAIL:-}" ]]; then
+    python3 "$STATE_HELPER" notify-node-registered \
+        --email "$NOTIFY_EMAIL" \
+        --cluster-id "$CLUSTER_ID" \
+        --job-id "$SLURM_JOB_ID" \
+        --hostname "$HOSTNAME_VALUE" \
+        --ip "$IP_VALUE" \
+        --partition "$PARTITION_NAME"
+fi
 
 ROLE="worker"
 if python3 "$STATE_HELPER" try-become-head \

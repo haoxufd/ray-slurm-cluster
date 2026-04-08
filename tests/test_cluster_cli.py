@@ -65,6 +65,7 @@ printf '%s\n' "$1" >> "${FAKE_SLURM_ROOT}/scancel.log"
                 STATE_ROOT={self.state_root}
                 DATA_STORAGE_PATH={self.root}/data
                 LOG_ROOT={self.logs_dir}
+                NOTIFY_EMAIL=
                 RAY_PORT=6379
                 SLURM_TIME_LIMIT=2-00:00:00
                 A100_GPUS_PER_NODE=A100:4
@@ -102,6 +103,8 @@ printf '%s\n' "$1" >> "${FAKE_SLURM_ROOT}/scancel.log"
         jobs = (cluster_dir / "jobs.txt").read_text(encoding="utf-8").splitlines()
         self.assertEqual(jobs, ["1000", "1001"])
         self.assertEqual((cluster_dir / "desired_nodes").read_text().strip(), "2")
+        cluster_env = (cluster_dir / "cluster.env").read_text(encoding="utf-8")
+        self.assertIn("NOTIFY_EMAIL=", cluster_env)
 
     def test_status_and_down_use_saved_cluster_state(self):
         self.write_config()
@@ -116,6 +119,15 @@ printf '%s\n' "$1" >> "${FAKE_SLURM_ROOT}/scancel.log"
         self.assertFalse((self.state_root / cluster_id).exists())
         scancel_log = (self.root / "scancel.log").read_text(encoding="utf-8").splitlines()
         self.assertEqual(scancel_log, ["1000", "1001"])
+
+    def test_up_allows_email_override(self):
+        self.write_config()
+
+        result = self.run_cmd("up", "1", "a100q", "--email", "user@example.com")
+
+        cluster_id = result.stdout.strip().split("cluster_id=")[1].splitlines()[0]
+        cluster_env = (self.state_root / cluster_id / "cluster.env").read_text(encoding="utf-8")
+        self.assertIn("NOTIFY_EMAIL=user@example.com", cluster_env)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -14,15 +15,20 @@ class ClusterStateCliTest(unittest.TestCase):
         self.tmpdir = tempfile.TemporaryDirectory()
         self.state_root = Path(self.tmpdir.name)
         self.cluster_id = "demo"
+        self.bin_dir = self.state_root / "bin"
+        self.bin_dir.mkdir()
 
     def tearDown(self):
         self.tmpdir.cleanup()
 
     def run_cmd(self, *args, check=True):
+        env = os.environ.copy()
+        env["PATH"] = f"{self.bin_dir}:{env['PATH']}"
         proc = subprocess.run(
             ["python3", str(SCRIPT), *args],
             text=True,
             capture_output=True,
+            env=env,
         )
         if check and proc.returncode != 0:
             self.fail(
@@ -39,6 +45,8 @@ class ClusterStateCliTest(unittest.TestCase):
             self.cluster_id,
             "--num-nodes",
             "2",
+            "--partition",
+            "a100q",
         )
 
         cluster_dir = self.state_root / self.cluster_id
@@ -56,6 +64,8 @@ class ClusterStateCliTest(unittest.TestCase):
             self.cluster_id,
             "--num-nodes",
             "2",
+            "--partition",
+            "a100q",
         )
         self.run_cmd(
             "add-job",
@@ -95,6 +105,8 @@ class ClusterStateCliTest(unittest.TestCase):
             self.cluster_id,
             "--num-nodes",
             "2",
+            "--partition",
+            "a100q",
         )
 
         first = self.run_cmd(
@@ -148,6 +160,8 @@ class ClusterStateCliTest(unittest.TestCase):
             self.cluster_id,
             "--num-nodes",
             "2",
+            "--partition",
+            "a100q",
         )
         self.run_cmd(
             "add-job",
@@ -279,6 +293,43 @@ class ClusterStateCliTest(unittest.TestCase):
             self.cluster_id,
         )
         self.assertFalse((self.state_root / self.cluster_id).exists())
+
+    def test_notify_node_registered_uses_mail_command(self):
+        mail_log = self.state_root / "mail.log"
+        mail_script = self.bin_dir / "mail"
+        mail_script.write_text(
+            "#!/bin/bash\n"
+            "set -euo pipefail\n"
+            "body=\"$(cat)\"\n"
+            "printf 'args:%s\\n' \"$*\" >> \"" + str(mail_log) + "\"\n"
+            "printf 'body:%s\\n' \"$body\" >> \"" + str(mail_log) + "\"\n",
+            encoding="utf-8",
+        )
+        mail_script.chmod(0o755)
+
+        self.run_cmd(
+            "notify-node-registered",
+            "--email",
+            "user@example.com",
+            "--cluster-id",
+            self.cluster_id,
+            "--job-id",
+            "101",
+            "--hostname",
+            "n1",
+            "--ip",
+            "10.0.0.1",
+            "--partition",
+            "a100q",
+        )
+
+        log_text = mail_log.read_text(encoding="utf-8")
+        self.assertIn("args:-s [ray-slurm-cluster] node registered for demo user@example.com", log_text)
+        self.assertIn("body:cluster_id=demo", log_text)
+        self.assertIn("job_id=101", log_text)
+        self.assertIn("hostname=n1", log_text)
+        self.assertIn("ip=10.0.0.1", log_text)
+        self.assertIn("partition=a100q", log_text)
 
 
 if __name__ == "__main__":
