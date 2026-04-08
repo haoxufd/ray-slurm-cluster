@@ -6,6 +6,7 @@ if [[ -z "${REPO_ROOT:-}" ]]; then
 fi
 
 STATE_HELPER="$REPO_ROOT/scripts/cluster_state.py"
+APPTAINER_BIN="${APPTAINER_BIN:-apptainer}"
 
 if [[ -z "${CLUSTER_ID:-}" || -z "${STATE_ROOT:-}" || -z "${SIF_PATH:-}" || -z "${DATA_STORAGE_PATH:-}" || -z "${RAY_PORT:-}" || -z "${PARTITION_NAME:-}" ]]; then
     echo "missing required environment variables" >&2
@@ -23,13 +24,15 @@ python3 "$STATE_HELPER" register-node \
     --ip "$IP_VALUE"
 
 if [[ -n "${NOTIFY_EMAIL:-}" ]]; then
-    python3 "$STATE_HELPER" notify-node-registered \
+    if ! python3 "$STATE_HELPER" notify-node-registered \
         --email "$NOTIFY_EMAIL" \
         --cluster-id "$CLUSTER_ID" \
         --job-id "$SLURM_JOB_ID" \
         --hostname "$HOSTNAME_VALUE" \
         --ip "$IP_VALUE" \
-        --partition "$PARTITION_NAME"
+        --partition "$PARTITION_NAME"; then
+        echo "warning: node registration email failed for cluster=$CLUSTER_ID job=$SLURM_JOB_ID" >&2
+    fi
 fi
 
 ROLE="worker"
@@ -41,10 +44,10 @@ if python3 "$STATE_HELPER" try-become-head \
 fi
 
 module load apptainer
-apptainer instance start --nv --bind /tmp:/tmp --bind "$DATA_STORAGE_PATH:$DATA_STORAGE_PATH" "$SIF_PATH" run
+"$APPTAINER_BIN" instance start --nv --bind /tmp:/tmp --bind "$DATA_STORAGE_PATH:$DATA_STORAGE_PATH" "$SIF_PATH" run
 
 if [[ "$ROLE" == "head" ]]; then
-    apptainer exec --nv instance://run \
+    "$APPTAINER_BIN" exec --nv instance://run \
         ray start --head \
         --node-ip-address="$IP_VALUE" \
         --port="$RAY_PORT" \
@@ -57,7 +60,7 @@ else
     HEAD_IP="$(python3 "$STATE_HELPER" wait-head-ip \
         --state-root "$STATE_ROOT" \
         --cluster-id "$CLUSTER_ID")"
-    apptainer exec --nv instance://run \
+    "$APPTAINER_BIN" exec --nv instance://run \
         ray start \
         --address="${HEAD_IP}:${RAY_PORT}"
 fi
