@@ -35,6 +35,18 @@ bin/cluster down <cluster_id>
 `scale` reuses the existing cluster's partition and notification settings, increases `desired_nodes`, and submits additional one-node jobs that join the current Ray cluster as workers.
 If `NOTIFY_EMAIL` is set in config, or `--email` is provided, each node sends one notification email after successful registration by calling the local `mail` command.
 
+## Head Failover
+
+If the current head job disappears while other cluster jobs are still running, the remaining nodes try to rebuild the Ray control plane automatically.
+
+- Nodes detect head loss by checking whether the recorded head job is still running in Slurm.
+- The replacement head is chosen from the remaining running jobs with the longest `TimeLeft`.
+- If there is a tie, the smaller Slurm job id wins.
+- The new head starts a fresh Ray head process and increments the cluster epoch.
+- Other nodes reconnect to the new head after the epoch changes.
+
+This recovery is not transparent to running Ray workloads. Expect a brief control-plane interruption while the new head is elected and the remaining nodes reconnect.
+
 ## Shared State
 
 Each cluster creates:

@@ -54,6 +54,7 @@ class ClusterStateCliTest(unittest.TestCase):
         self.assertTrue((cluster_dir / "workers").is_dir())
         self.assertEqual((cluster_dir / "desired_nodes").read_text().strip(), "2")
         self.assertEqual((cluster_dir / "jobs.txt").read_text(), "")
+        self.assertEqual((cluster_dir / "epoch").read_text().strip(), "0")
 
     def test_add_job_and_register_node_persist_metadata(self):
         self.run_cmd(
@@ -129,11 +130,13 @@ class ClusterStateCliTest(unittest.TestCase):
             check=False,
         )
         self.run_cmd(
-            "publish-head-ip",
+            "set-head",
             "--state-root",
             str(self.state_root),
             "--cluster-id",
             self.cluster_id,
+            "--job-id",
+            "101",
             "--ip",
             "10.0.0.1",
         )
@@ -150,6 +153,122 @@ class ClusterStateCliTest(unittest.TestCase):
         self.assertEqual(first.returncode, 0)
         self.assertNotEqual(second.returncode, 0)
         self.assertEqual(waited.stdout.strip(), "10.0.0.1")
+
+    def test_set_head_tracks_head_job_and_epoch(self):
+        self.run_cmd(
+            "init",
+            "--state-root",
+            str(self.state_root),
+            "--cluster-id",
+            self.cluster_id,
+            "--num-nodes",
+            "2",
+            "--partition",
+            "a100q",
+        )
+        self.run_cmd(
+            "set-head",
+            "--state-root",
+            str(self.state_root),
+            "--cluster-id",
+            self.cluster_id,
+            "--job-id",
+            "101",
+            "--ip",
+            "10.0.0.1",
+        )
+        head_job = self.run_cmd(
+            "get-head-job-id",
+            "--state-root",
+            str(self.state_root),
+            "--cluster-id",
+            self.cluster_id,
+        )
+        epoch = self.run_cmd(
+            "get-epoch",
+            "--state-root",
+            str(self.state_root),
+            "--cluster-id",
+            self.cluster_id,
+        )
+
+        self.assertEqual(head_job.stdout.strip(), "101")
+        self.assertEqual(epoch.stdout.strip(), "1")
+
+    def test_failover_lock_and_wait_head_update(self):
+        self.run_cmd(
+            "init",
+            "--state-root",
+            str(self.state_root),
+            "--cluster-id",
+            self.cluster_id,
+            "--num-nodes",
+            "2",
+            "--partition",
+            "a100q",
+        )
+        self.run_cmd(
+            "set-head",
+            "--state-root",
+            str(self.state_root),
+            "--cluster-id",
+            self.cluster_id,
+            "--job-id",
+            "101",
+            "--ip",
+            "10.0.0.1",
+        )
+        first_lock = self.run_cmd(
+            "try-acquire-failover-lock",
+            "--state-root",
+            str(self.state_root),
+            "--cluster-id",
+            self.cluster_id,
+            "--job-id",
+            "102",
+        )
+        second_lock = self.run_cmd(
+            "try-acquire-failover-lock",
+            "--state-root",
+            str(self.state_root),
+            "--cluster-id",
+            self.cluster_id,
+            "--job-id",
+            "103",
+            check=False,
+        )
+        self.assertEqual(first_lock.returncode, 0)
+        self.assertNotEqual(second_lock.returncode, 0)
+        self.run_cmd(
+            "release-failover-lock",
+            "--state-root",
+            str(self.state_root),
+            "--cluster-id",
+            self.cluster_id,
+        )
+        self.run_cmd(
+            "set-head",
+            "--state-root",
+            str(self.state_root),
+            "--cluster-id",
+            self.cluster_id,
+            "--job-id",
+            "102",
+            "--ip",
+            "10.0.0.2",
+        )
+        waited = self.run_cmd(
+            "wait-head-update",
+            "--state-root",
+            str(self.state_root),
+            "--cluster-id",
+            self.cluster_id,
+            "--min-epoch",
+            "1",
+            "--timeout-seconds",
+            "0.1",
+        )
+        self.assertEqual(waited.stdout.strip(), "10.0.0.2")
 
     def test_status_and_cleanup_reflect_cluster_progress(self):
         self.run_cmd(
@@ -204,11 +323,13 @@ class ClusterStateCliTest(unittest.TestCase):
             "101",
         )
         self.run_cmd(
-            "publish-head-ip",
+            "set-head",
             "--state-root",
             str(self.state_root),
             "--cluster-id",
             self.cluster_id,
+            "--job-id",
+            "101",
             "--ip",
             "10.0.0.1",
         )
@@ -256,6 +377,8 @@ class ClusterStateCliTest(unittest.TestCase):
         self.assertIn("registered_nodes=2", status.stdout)
         self.assertIn("ready_nodes=1", status.stdout)
         self.assertIn("head_ip=10.0.0.1", status.stdout)
+        self.assertIn("head_job_id=101", status.stdout)
+        self.assertIn("epoch=1", status.stdout)
         self.assertIn("cluster_ready=no", status.stdout)
         self.assertIn("job=101 hostname=n1 ip=10.0.0.1 role=head ready=yes", status.stdout)
         self.assertIn("job=102 hostname=n2 ip=10.0.0.2 role=worker ready=no", status.stdout)

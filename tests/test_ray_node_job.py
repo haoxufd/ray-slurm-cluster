@@ -58,9 +58,34 @@ set -euo pipefail
 exit 0
 """,
         )
+        self.make_fake_command(
+            "squeue",
+            """#!/bin/bash
+set -euo pipefail
+job_id=""
+field=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -j) job_id="$2"; shift 2 ;;
+    -O) field="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+case "${job_id}:${field}" in
+  9999:State) echo "COMPLETED" ;;
+  1234:State) echo "RUNNING" ;;
+  5678:State) echo "RUNNING" ;;
+  1234:TimeLeft) echo "02:00:00" ;;
+  5678:TimeLeft) echo "01:00:00" ;;
+esac
+""",
+        )
 
         helper = self.repo_dir / "scripts"
         helper.mkdir()
+        cluster_dir = self.state_root / "demo"
+        cluster_dir.mkdir()
+        (cluster_dir / "jobs.txt").write_text("1234\n5678\n", encoding="utf-8")
         (helper / "cluster_state.py").write_text(
             textwrap.dedent(
                 """\
@@ -72,12 +97,27 @@ exit 0
                 log.write_text(log.read_text() + " ".join(sys.argv[1:]) + "\\n" if log.exists() else " ".join(sys.argv[1:]) + "\\n")
                 cmd = sys.argv[1]
                 if cmd == "try-become-head":
-                    sys.exit(0)
+                    sys.exit(1)
                 if cmd == "notify-node-registered":
                     print("mail failed", file=sys.stderr)
                     sys.exit(1)
-                if cmd == "wait-head-ip":
-                    print("10.0.0.1")
+                if cmd == "wait-head-update":
+                    min_epoch = sys.argv[sys.argv.index("--min-epoch") + 1]
+                    print("10.0.0.9" if min_epoch == "0" else "10.0.0.1")
+                    sys.exit(0)
+                if cmd == "get-head-job-id":
+                    print("9999")
+                    sys.exit(0)
+                if cmd == "get-epoch":
+                    if (Path(__import__("os").environ["TEST_ROOT"]) / "set-head.done").exists():
+                        print("2")
+                    else:
+                        print("1")
+                    sys.exit(0)
+                if cmd == "try-acquire-failover-lock":
+                    sys.exit(0)
+                if cmd == "set-head":
+                    (Path(__import__("os").environ["TEST_ROOT"]) / "set-head.done").write_text("yes\\n")
                     sys.exit(0)
                 sys.exit(0)
                 """
@@ -110,6 +150,9 @@ exit 0
                 "NOTIFY_EMAIL": "user@example.com",
                 "SLURM_JOB_ID": "1234",
                 "APPTAINER_BIN": str(self.bin_dir / "apptainer"),
+                "SQUEUE_BIN": str(self.bin_dir / "squeue"),
+                "HEAD_CHECK_INTERVAL_SECONDS": "0",
+                "MAX_MONITOR_ITERATIONS": "1",
             }
         )
 
@@ -122,7 +165,11 @@ exit 0
 
         self.assertEqual(proc.returncode, 0, msg=proc.stderr)
         self.assertIn("warning: node registration email failed", proc.stderr)
-        self.assertIn("exec --nv instance://run ray start --head", (self.root / "apptainer.log").read_text(encoding="utf-8"))
+        apptainer_log = (self.root / "apptainer.log").read_text(encoding="utf-8")
+        self.assertIn("exec --nv instance://run ray start --address=10.0.0.9:6379", apptainer_log)
+        self.assertIn("exec --nv instance://run ray start --head --node-ip-address=10.0.0.1 --port=6379 --temp-dir=/tmp", apptainer_log)
+        helper_log = (self.root / "helper.log").read_text(encoding="utf-8")
+        self.assertIn("set-head --state-root", helper_log)
 
 
 if __name__ == "__main__":

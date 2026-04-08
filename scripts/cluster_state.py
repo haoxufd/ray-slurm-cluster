@@ -33,6 +33,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     (root / "workers").mkdir()
     (root / "desired_nodes").write_text(f"{args.num_nodes}\n")
     (root / "jobs.txt").write_text("")
+    (root / "epoch").write_text("0\n", encoding="utf-8")
     notify_email = args.notify_email or ""
     cluster_env_lines = [
         f"CLUSTER_ID={args.cluster_id}",
@@ -82,6 +83,15 @@ def cmd_publish_head_ip(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_set_head(args: argparse.Namespace) -> int:
+    root = require_cluster(args.state_root, args.cluster_id)
+    current_epoch = int((root / "epoch").read_text(encoding="utf-8").strip())
+    (root / "head.lock").write_text(f"{args.job_id}\n", encoding="utf-8")
+    (root / "head_ip").write_text(f"{args.ip}\n", encoding="utf-8")
+    (root / "epoch").write_text(f"{current_epoch + 1}\n", encoding="utf-8")
+    return 0
+
+
 def cmd_wait_head_ip(args: argparse.Namespace) -> int:
     root = require_cluster(args.state_root, args.cluster_id)
     head_ip_path = root / "head_ip"
@@ -93,6 +103,55 @@ def cmd_wait_head_ip(args: argparse.Namespace) -> int:
         time.sleep(args.poll_interval)
     print("timed out waiting for head_ip", file=sys.stderr)
     return 1
+
+
+def cmd_wait_head_update(args: argparse.Namespace) -> int:
+    root = require_cluster(args.state_root, args.cluster_id)
+    epoch_path = root / "epoch"
+    head_ip_path = root / "head_ip"
+    deadline = time.time() + args.timeout_seconds
+    while time.time() <= deadline:
+        current_epoch = int(epoch_path.read_text(encoding="utf-8").strip())
+        if current_epoch > args.min_epoch and head_ip_path.exists():
+            print(head_ip_path.read_text(encoding="utf-8").strip())
+            return 0
+        time.sleep(args.poll_interval)
+    print("timed out waiting for head update", file=sys.stderr)
+    return 1
+
+
+def cmd_get_head_job_id(args: argparse.Namespace) -> int:
+    root = require_cluster(args.state_root, args.cluster_id)
+    head_lock = root / "head.lock"
+    if head_lock.exists():
+        print(head_lock.read_text(encoding="utf-8").strip())
+    return 0
+
+
+def cmd_get_epoch(args: argparse.Namespace) -> int:
+    root = require_cluster(args.state_root, args.cluster_id)
+    print((root / "epoch").read_text(encoding="utf-8").strip())
+    return 0
+
+
+def cmd_try_acquire_failover_lock(args: argparse.Namespace) -> int:
+    root = require_cluster(args.state_root, args.cluster_id)
+    lock_path = root / "failover.lock"
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        return 1
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(f"{args.job_id}\n")
+    return 0
+
+
+def cmd_release_failover_lock(args: argparse.Namespace) -> int:
+    root = require_cluster(args.state_root, args.cluster_id)
+    lock_path = root / "failover.lock"
+    if lock_path.exists():
+        lock_path.unlink()
+    return 0
 
 
 def cmd_mark_worker_ready(args: argparse.Namespace) -> int:
@@ -140,7 +199,9 @@ def cmd_status(args: argparse.Namespace) -> int:
         f"submitted_jobs={len(jobs)}",
         f"registered_nodes={registered}",
         f"ready_nodes={ready_nodes}",
+        f"head_job_id={head_job_id or 'unknown'}",
         f"head_ip={head_ip}",
+        f"epoch={(root / 'epoch').read_text(encoding='utf-8').strip()}",
         f"cluster_ready={is_ready}",
     ]
     ready_job_ids = {path.name for path in (root / "workers").iterdir() if path.is_file()}
@@ -234,12 +295,48 @@ def build_parser() -> argparse.ArgumentParser:
     publish_parser.add_argument("--ip", required=True)
     publish_parser.set_defaults(func=cmd_publish_head_ip)
 
+    set_head_parser = subparsers.add_parser("set-head")
+    set_head_parser.add_argument("--state-root", required=True)
+    set_head_parser.add_argument("--cluster-id", required=True)
+    set_head_parser.add_argument("--job-id", required=True)
+    set_head_parser.add_argument("--ip", required=True)
+    set_head_parser.set_defaults(func=cmd_set_head)
+
     wait_parser = subparsers.add_parser("wait-head-ip")
     wait_parser.add_argument("--state-root", required=True)
     wait_parser.add_argument("--cluster-id", required=True)
     wait_parser.add_argument("--timeout-seconds", type=float, default=600)
     wait_parser.add_argument("--poll-interval", type=float, default=1.0)
     wait_parser.set_defaults(func=cmd_wait_head_ip)
+
+    wait_update_parser = subparsers.add_parser("wait-head-update")
+    wait_update_parser.add_argument("--state-root", required=True)
+    wait_update_parser.add_argument("--cluster-id", required=True)
+    wait_update_parser.add_argument("--min-epoch", type=int, required=True)
+    wait_update_parser.add_argument("--timeout-seconds", type=float, default=600)
+    wait_update_parser.add_argument("--poll-interval", type=float, default=1.0)
+    wait_update_parser.set_defaults(func=cmd_wait_head_update)
+
+    get_head_parser = subparsers.add_parser("get-head-job-id")
+    get_head_parser.add_argument("--state-root", required=True)
+    get_head_parser.add_argument("--cluster-id", required=True)
+    get_head_parser.set_defaults(func=cmd_get_head_job_id)
+
+    get_epoch_parser = subparsers.add_parser("get-epoch")
+    get_epoch_parser.add_argument("--state-root", required=True)
+    get_epoch_parser.add_argument("--cluster-id", required=True)
+    get_epoch_parser.set_defaults(func=cmd_get_epoch)
+
+    failover_parser = subparsers.add_parser("try-acquire-failover-lock")
+    failover_parser.add_argument("--state-root", required=True)
+    failover_parser.add_argument("--cluster-id", required=True)
+    failover_parser.add_argument("--job-id", required=True)
+    failover_parser.set_defaults(func=cmd_try_acquire_failover_lock)
+
+    release_failover_parser = subparsers.add_parser("release-failover-lock")
+    release_failover_parser.add_argument("--state-root", required=True)
+    release_failover_parser.add_argument("--cluster-id", required=True)
+    release_failover_parser.set_defaults(func=cmd_release_failover_lock)
 
     ready_parser = subparsers.add_parser("mark-worker-ready")
     ready_parser.add_argument("--state-root", required=True)
