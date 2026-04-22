@@ -17,13 +17,56 @@ class ClusterStateCliTest(unittest.TestCase):
         self.cluster_id = "demo"
         self.bin_dir = self.state_root / "bin"
         self.bin_dir.mkdir()
+        squeue_script = self.bin_dir / "squeue"
+        squeue_script.write_text(
+            "#!/bin/bash\n"
+            "set -euo pipefail\n"
+            "if [[ \"${TEST_SQUEUE_FAIL:-0}\" == \"1\" ]]; then\n"
+            "  echo \"slurm_load_jobs error: controller unavailable\" >&2\n"
+            "  exit 1\n"
+            "fi\n"
+            "job_ids=\"\"\n"
+            "field=\"\"\n"
+            "while [[ $# -gt 0 ]]; do\n"
+            "  case \"$1\" in\n"
+            "    -j) job_ids=\"$2\"; shift 2 ;;\n"
+            "    -O) field=\"$2\"; shift 2 ;;\n"
+            "    -h) shift ;;\n"
+            "    *) shift ;;\n"
+            "  esac\n"
+            "done\n"
+            "if [[ \"$field\" != \"JobID,State\" ]]; then\n"
+            "  exit 0\n"
+            "fi\n"
+            "mappings=\"${TEST_SQUEUE_STATES:-101=RUNNING,102=RUNNING}\"\n"
+            "IFS=',' read -r -a mapping_arr <<< \"$mappings\"\n"
+            "IFS=',' read -r -a job_arr <<< \"$job_ids\"\n"
+            "for job_id in \"${job_arr[@]}\"; do\n"
+            "  state=\"\"\n"
+            "  for mapping in \"${mapping_arr[@]}\"; do\n"
+            "    key=\"${mapping%%=*}\"\n"
+            "    value=\"${mapping#*=}\"\n"
+            "    if [[ \"$key\" == \"$job_id\" ]]; then\n"
+            "      state=\"$value\"\n"
+            "      break\n"
+            "    fi\n"
+            "  done\n"
+            "  if [[ -n \"$state\" ]]; then\n"
+            "    echo \"$job_id $state\"\n"
+            "  fi\n"
+            "done\n",
+            encoding="utf-8",
+        )
+        squeue_script.chmod(0o755)
 
     def tearDown(self):
         self.tmpdir.cleanup()
 
-    def run_cmd(self, *args, check=True):
+    def run_cmd(self, *args, check=True, extra_env=None):
         env = os.environ.copy()
         env["PATH"] = f"{self.bin_dir}:{env['PATH']}"
+        if extra_env:
+            env.update(extra_env)
         proc = subprocess.run(
             ["python3", str(SCRIPT), *args],
             text=True,
@@ -372,16 +415,10 @@ class ClusterStateCliTest(unittest.TestCase):
         )
 
         self.assertIn("cluster_id=demo", status.stdout)
-        self.assertIn("desired_nodes=2", status.stdout)
-        self.assertIn("submitted_jobs=2", status.stdout)
-        self.assertIn("registered_nodes=2", status.stdout)
-        self.assertIn("ready_nodes=1", status.stdout)
-        self.assertIn("head_ip=10.0.0.1", status.stdout)
-        self.assertIn("head_job_id=101", status.stdout)
-        self.assertIn("epoch=1", status.stdout)
-        self.assertIn("cluster_ready=no", status.stdout)
-        self.assertIn("job=101 hostname=n1 ip=10.0.0.1 role=head ready=yes", status.stdout)
-        self.assertIn("job=102 hostname=n2 ip=10.0.0.2 role=worker ready=no", status.stdout)
+        self.assertIn("active_nodes=2", status.stdout)
+        self.assertIn("head_node=n1", status.stdout)
+        self.assertIn("node=n1", status.stdout)
+        self.assertIn("node=n2", status.stdout)
 
         self.run_cmd(
             "mark-worker-ready",
@@ -406,7 +443,7 @@ class ClusterStateCliTest(unittest.TestCase):
             "--cluster-id",
             self.cluster_id,
         )
-        self.assertIn("cluster_ready=yes", status_ready.stdout)
+        self.assertIn("active_nodes=2", status_ready.stdout)
 
         self.run_cmd(
             "cleanup",
@@ -416,6 +453,163 @@ class ClusterStateCliTest(unittest.TestCase):
             self.cluster_id,
         )
         self.assertFalse((self.state_root / self.cluster_id).exists())
+
+    def test_status_excludes_non_running_jobs_from_ready_nodes(self):
+        self.run_cmd(
+            "init",
+            "--state-root",
+            str(self.state_root),
+            "--cluster-id",
+            self.cluster_id,
+            "--num-nodes",
+            "2",
+            "--partition",
+            "a100q",
+        )
+        for job_id, hostname, ip in [("101", "n1", "10.0.0.1"), ("102", "n2", "10.0.0.2")]:
+            self.run_cmd(
+                "add-job",
+                "--state-root",
+                str(self.state_root),
+                "--cluster-id",
+                self.cluster_id,
+                "--job-id",
+                job_id,
+            )
+            self.run_cmd(
+                "register-node",
+                "--state-root",
+                str(self.state_root),
+                "--cluster-id",
+                self.cluster_id,
+                "--job-id",
+                job_id,
+                "--hostname",
+                hostname,
+                "--ip",
+                ip,
+            )
+            self.run_cmd(
+                "mark-worker-ready",
+                "--state-root",
+                str(self.state_root),
+                "--cluster-id",
+                self.cluster_id,
+                "--job-id",
+                job_id,
+            )
+        self.run_cmd(
+            "set-head",
+            "--state-root",
+            str(self.state_root),
+            "--cluster-id",
+            self.cluster_id,
+            "--job-id",
+            "101",
+            "--ip",
+            "10.0.0.1",
+        )
+
+        status = self.run_cmd(
+            "status",
+            "--state-root",
+            str(self.state_root),
+            "--cluster-id",
+            self.cluster_id,
+            extra_env={"TEST_SQUEUE_STATES": "101=RUNNING,102=FAILED"},
+        )
+
+        self.assertIn("active_nodes=1", status.stdout)
+        self.assertIn("node=n1", status.stdout)
+        self.assertNotIn("node=n2", status.stdout)
+        self.assertFalse((self.state_root / self.cluster_id / "nodes" / "102.json").exists())
+        self.assertFalse((self.state_root / self.cluster_id / "workers" / "102").exists())
+
+    def test_status_auto_cleanup_removes_stale_cluster(self):
+        self.run_cmd(
+            "init",
+            "--state-root",
+            str(self.state_root),
+            "--cluster-id",
+            self.cluster_id,
+            "--num-nodes",
+            "1",
+            "--partition",
+            "a100q",
+        )
+        self.run_cmd(
+            "add-job",
+            "--state-root",
+            str(self.state_root),
+            "--cluster-id",
+            self.cluster_id,
+            "--job-id",
+            "101",
+        )
+        self.run_cmd(
+            "register-node",
+            "--state-root",
+            str(self.state_root),
+            "--cluster-id",
+            self.cluster_id,
+            "--job-id",
+            "101",
+            "--hostname",
+            "n1",
+            "--ip",
+            "10.0.0.1",
+        )
+
+        status = self.run_cmd(
+            "status",
+            "--state-root",
+            str(self.state_root),
+            "--cluster-id",
+            self.cluster_id,
+            "--auto-cleanup-stale",
+            extra_env={"TEST_SQUEUE_STATES": "101=FAILED"},
+        )
+
+        self.assertIn("cluster_id=demo", status.stdout)
+        self.assertIn("cluster_removed=1", status.stdout)
+        self.assertIn("reason=no_active_jobs", status.stdout)
+        self.assertFalse((self.state_root / self.cluster_id).exists())
+
+    def test_status_auto_cleanup_keeps_cluster_when_slurm_unavailable(self):
+        self.run_cmd(
+            "init",
+            "--state-root",
+            str(self.state_root),
+            "--cluster-id",
+            self.cluster_id,
+            "--num-nodes",
+            "1",
+            "--partition",
+            "a100q",
+        )
+        self.run_cmd(
+            "add-job",
+            "--state-root",
+            str(self.state_root),
+            "--cluster-id",
+            self.cluster_id,
+            "--job-id",
+            "101",
+        )
+
+        status = self.run_cmd(
+            "status",
+            "--state-root",
+            str(self.state_root),
+            "--cluster-id",
+            self.cluster_id,
+            "--auto-cleanup-stale",
+            extra_env={"TEST_SQUEUE_FAIL": "1"},
+        )
+
+        self.assertIn("cluster_id=demo", status.stdout)
+        self.assertIn("cluster_removed=0", status.stdout)
+        self.assertTrue((self.state_root / self.cluster_id).exists())
 
     def test_notify_node_registered_uses_mail_command(self):
         mail_log = self.state_root / "mail.log"
@@ -453,6 +647,49 @@ class ClusterStateCliTest(unittest.TestCase):
         self.assertIn("hostname=n1", log_text)
         self.assertIn("ip=10.0.0.1", log_text)
         self.assertIn("partition=a100q", log_text)
+
+    def test_notify_node_failed_uses_mail_command(self):
+        mail_log = self.state_root / "mail.log"
+        mail_script = self.bin_dir / "mail"
+        mail_script.write_text(
+            "#!/bin/bash\n"
+            "set -euo pipefail\n"
+            "body=\"$(cat)\"\n"
+            "printf 'args:%s\\n' \"$*\" >> \"" + str(mail_log) + "\"\n"
+            "printf 'body:%s\\n' \"$body\" >> \"" + str(mail_log) + "\"\n",
+            encoding="utf-8",
+        )
+        mail_script.chmod(0o755)
+
+        self.run_cmd(
+            "notify-node-failed",
+            "--email",
+            "user@example.com",
+            "--cluster-id",
+            self.cluster_id,
+            "--job-id",
+            "101",
+            "--hostname",
+            "n1",
+            "--ip",
+            "10.0.0.1",
+            "--partition",
+            "a100q",
+            "--exit-code",
+            "17",
+            "--log-path",
+            "/tmp/job_101.out",
+            "--log-tail",
+            "line-1\nline-2",
+        )
+
+        log_text = mail_log.read_text(encoding="utf-8")
+        self.assertIn("args:-s [ray-slurm-cluster] node failed for demo user@example.com", log_text)
+        self.assertIn("body:cluster_id=demo", log_text)
+        self.assertIn("job_id=101", log_text)
+        self.assertIn("exit_code=17", log_text)
+        self.assertIn("log_path=/tmp/job_101.out", log_text)
+        self.assertIn("log_tail:\nline-1\nline-2", log_text)
 
     def test_update_desired_nodes_increases_target_size(self):
         self.run_cmd(

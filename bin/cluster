@@ -5,14 +5,16 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG_PATH="${CLUSTER_CONFIG:-$REPO_ROOT/config/cluster.env}"
 STATE_HELPER="$REPO_ROOT/scripts/cluster_state.py"
 SLURM_JOB_SCRIPT="$REPO_ROOT/slurm/ray_node_job.sh"
+DEFAULT_TMP_PREFIX="/mnt/vast-nhr/projects/nii00233/xuhao/ray-tmp"
 
 usage() {
     cat <<'EOF'
 Usage:
-  bin/cluster up <num_nodes> <partition> [--email <addr>]
-  bin/cluster scale <cluster_id> <add_nodes>
-  bin/cluster status <cluster_id>
-  bin/cluster down <cluster_id>
+  bin/cluster up <num_nodes> <partition> [--email <addr>] [--gpus-per-node <spec>] [--ray-tmp-prefix <path>] [--exclude-nodes <node1,node2>] [--no-constraint]
+  bin/cluster scale [<cluster_id>] <add_nodes> [--gpus-per-node <spec>] [--ray-tmp-prefix <path>] [--exclude-nodes <node1,node2>] [--no-constraint]
+  bin/cluster status [cluster_id]
+  bin/cluster down [cluster_id]
+  bin/cluster list
 EOF
 }
 
@@ -37,17 +39,59 @@ select_gpu_config() {
     local partition=$1
     if [[ "$partition" == *h100* ]]; then
         GPUS_PER_NODE="$H100_GPUS_PER_NODE"
-        CONSTRAINT_ARGS=()
-        if [[ -n "${H100_CONSTRAINT:-}" ]]; then
-            CONSTRAINT_ARGS=(--constraint="$H100_CONSTRAINT")
-        fi
+        DEFAULT_CONSTRAINT="${H100_CONSTRAINT:-}"
     else
         GPUS_PER_NODE="$A100_GPUS_PER_NODE"
-        CONSTRAINT_ARGS=()
-        if [[ -n "${A100_CONSTRAINT:-}" ]]; then
-            CONSTRAINT_ARGS=(--constraint="$A100_CONSTRAINT")
-        fi
+        DEFAULT_CONSTRAINT="${A100_CONSTRAINT:-}"
     fi
+}
+
+resolve_gpu_spec() {
+    local partition=$1
+    local override=${2:-}
+    if [[ -n "$override" ]]; then
+        printf '%s\n' "$override"
+        return 0
+    fi
+    select_gpu_config "$partition"
+    printf '%s\n' "$GPUS_PER_NODE"
+}
+
+resolve_constraint_args() {
+    local partition=$1
+    local use_constraint=$2
+    select_gpu_config "$partition"
+    CONSTRAINT_ARGS=()
+    if [[ "$use_constraint" == "1" && -n "${DEFAULT_CONSTRAINT:-}" ]]; then
+        CONSTRAINT_ARGS=(--constraint="$DEFAULT_CONSTRAINT")
+    fi
+}
+
+list_clusters() {
+    if [[ ! -d "$STATE_ROOT" ]]; then
+        return 0
+    fi
+    find "$STATE_ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort
+}
+
+resolve_cluster_id_arg() {
+    local provided=${1:-}
+    if [[ -n "$provided" ]]; then
+        printf '%s\n' "$provided"
+        return 0
+    fi
+
+    mapfile -t cluster_ids < <(list_clusters)
+    if [[ ${#cluster_ids[@]} -eq 0 ]]; then
+        echo "no cluster found under STATE_ROOT=$STATE_ROOT" >&2
+        exit 1
+    fi
+    if [[ ${#cluster_ids[@]} -gt 1 ]]; then
+        echo "multiple clusters found, please specify cluster_id:" >&2
+        printf '%s\n' "${cluster_ids[@]}" >&2
+        exit 1
+    fi
+    printf '%s\n' "${cluster_ids[0]}"
 }
 
 generate_cluster_id() {
@@ -66,24 +110,34 @@ submit_nodes() {
     local partition=$2
     local num_nodes=$3
     local notify_email=$4
+    local gpu_spec=$5
+    local use_constraint=$6
+    local tmp_prefix=$7
+    local exclude_nodes=$8
+    local cluster_suffix="${cluster_id##*-}"
 
-    select_gpu_config "$partition"
+    resolve_constraint_args "$partition" "$use_constraint"
+    local exclude_args=()
+    if [[ -n "$exclude_nodes" ]]; then
+        exclude_args=(--exclude="$exclude_nodes")
+    fi
 
     local job_id
     local log_path
     for _ in $(seq 1 "$num_nodes"); do
         log_path="$LOG_ROOT/job_%j.out"
         job_id="$(sbatch --parsable \
-            --job-name="ray-node-$cluster_id" \
+            --job-name="$cluster_suffix" \
             --partition="$partition" \
-            --gpus-per-node="$GPUS_PER_NODE" \
+            --gpus-per-node="$gpu_spec" \
             "${CONSTRAINT_ARGS[@]}" \
+            "${exclude_args[@]}" \
             -t "$SLURM_TIME_LIMIT" \
             -N 1 \
             --ntasks=1 \
             --output="$log_path" \
             --exclusive \
-            --export=ALL,CLUSTER_ID="$cluster_id",STATE_ROOT="$STATE_ROOT",SIF_PATH="$SIF_PATH",DATA_STORAGE_PATH="$DATA_STORAGE_PATH",RAY_PORT="$RAY_PORT",REPO_ROOT="$REPO_ROOT",PARTITION_NAME="$partition",NOTIFY_EMAIL="$notify_email" \
+            --export=CLUSTER_ID="$cluster_id",STATE_ROOT="$STATE_ROOT",SIF_PATH="$SIF_PATH",DATA_STORAGE_PATH="$DATA_STORAGE_PATH",RAY_PORT="$RAY_PORT",TMP_PREFIX="$tmp_prefix",REPO_ROOT="$REPO_ROOT",PARTITION_NAME="$partition",NOTIFY_EMAIL="$notify_email",JOB_LOG_PATH_TEMPLATE="$log_path" \
             "$SLURM_JOB_SCRIPT")"
         python3 "$STATE_HELPER" add-job \
             --state-root "$STATE_ROOT" \
@@ -93,7 +147,7 @@ submit_nodes() {
 }
 
 cmd_up() {
-    if [[ $# -lt 2 || $# -gt 4 ]]; then
+    if [[ $# -lt 2 || $# -gt 11 ]]; then
         usage
         exit 1
     fi
@@ -101,14 +155,56 @@ cmd_up() {
     local num_nodes=$1
     local partition=$2
     local cli_notify_email=""
+    local cli_gpu_spec=""
+    local cli_tmp_prefix=""
+    local cli_exclude_nodes=""
+    local use_constraint=1
 
-    if [[ $# -eq 4 ]]; then
-        if [[ "$3" != "--email" || -z "$4" ]]; then
-            usage
-            exit 1
-        fi
-        cli_notify_email=$4
-    fi
+    shift 2
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --email)
+                if [[ $# -lt 2 || -z "$2" ]]; then
+                    usage
+                    exit 1
+                fi
+                cli_notify_email=$2
+                shift 2
+                ;;
+            --gpus-per-node)
+                if [[ $# -lt 2 || -z "$2" ]]; then
+                    usage
+                    exit 1
+                fi
+                cli_gpu_spec=$2
+                shift 2
+                ;;
+            --ray-tmp-prefix)
+                if [[ $# -lt 2 || -z "$2" ]]; then
+                    usage
+                    exit 1
+                fi
+                cli_tmp_prefix=$2
+                shift 2
+                ;;
+            --exclude-nodes)
+                if [[ $# -lt 2 || -z "$2" ]]; then
+                    usage
+                    exit 1
+                fi
+                cli_exclude_nodes=$2
+                shift 2
+                ;;
+            --no-constraint)
+                use_constraint=0
+                shift
+                ;;
+            *)
+                usage
+                exit 1
+                ;;
+        esac
+    done
 
     if ! [[ "$num_nodes" =~ ^[1-9][0-9]*$ ]]; then
         echo "num_nodes must be a positive integer" >&2
@@ -120,6 +216,10 @@ cmd_up() {
     local cluster_id
     cluster_id="$(generate_cluster_id)"
     local effective_notify_email="${cli_notify_email:-${NOTIFY_EMAIL:-}}"
+    local effective_gpu_spec
+    effective_gpu_spec="$(resolve_gpu_spec "$partition" "$cli_gpu_spec")"
+    local effective_tmp_prefix="${cli_tmp_prefix:-${TMP_PREFIX:-$DEFAULT_TMP_PREFIX}}"
+    local effective_exclude_nodes="${cli_exclude_nodes:-${EXCLUDE_NODES:-}}"
 
     python3 "$STATE_HELPER" init \
         --state-root "$STATE_ROOT" \
@@ -128,27 +228,90 @@ cmd_up() {
         --partition "$partition" \
         --notify-email "$effective_notify_email"
 
-    submit_nodes "$cluster_id" "$partition" "$num_nodes" "$effective_notify_email"
+    {
+        echo "GPUS_PER_NODE=$effective_gpu_spec"
+        echo "TMP_PREFIX=$effective_tmp_prefix"
+        echo "EXCLUDE_NODES=$effective_exclude_nodes"
+        echo "USE_CONSTRAINT=$use_constraint"
+    } >> "$STATE_ROOT/$cluster_id/cluster.env"
+
+    submit_nodes "$cluster_id" "$partition" "$num_nodes" "$effective_notify_email" "$effective_gpu_spec" "$use_constraint" "$effective_tmp_prefix" "$effective_exclude_nodes"
 
     echo "cluster_id=$cluster_id"
 }
 
 cmd_scale() {
-    if [[ $# -ne 2 ]]; then
+    if [[ $# -lt 1 || $# -gt 9 ]]; then
         usage
-        exit 1
-    fi
-
-    local cluster_id=$1
-    local add_nodes=$2
-
-    if ! [[ "$add_nodes" =~ ^[1-9][0-9]*$ ]]; then
-        echo "add_nodes must be a positive integer" >&2
         exit 1
     fi
 
     require_config
     require_common_paths
+
+    local cluster_id=""
+    local add_nodes=""
+    local cli_gpu_spec=""
+    local cli_tmp_prefix=""
+    local cli_exclude_nodes=""
+    local cli_use_constraint=""
+
+    if [[ "$1" =~ ^[1-9][0-9]*$ ]]; then
+        add_nodes=$1
+        shift
+        cluster_id="$(resolve_cluster_id_arg "")"
+    else
+        cluster_id="$1"
+        shift
+        if [[ $# -lt 1 ]]; then
+            usage
+            exit 1
+        fi
+        add_nodes="$1"
+        shift
+    fi
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --gpus-per-node)
+                if [[ $# -lt 2 || -z "$2" ]]; then
+                    usage
+                    exit 1
+                fi
+                cli_gpu_spec=$2
+                shift 2
+                ;;
+            --ray-tmp-prefix)
+                if [[ $# -lt 2 || -z "$2" ]]; then
+                    usage
+                    exit 1
+                fi
+                cli_tmp_prefix=$2
+                shift 2
+                ;;
+            --exclude-nodes)
+                if [[ $# -lt 2 || -z "$2" ]]; then
+                    usage
+                    exit 1
+                fi
+                cli_exclude_nodes=$2
+                shift 2
+                ;;
+            --no-constraint)
+                cli_use_constraint=0
+                shift
+                ;;
+            *)
+                usage
+                exit 1
+                ;;
+        esac
+    done
+
+    if ! [[ "$add_nodes" =~ ^[1-9][0-9]*$ ]]; then
+        echo "add_nodes must be a positive integer" >&2
+        exit 1
+    fi
 
     local cluster_dir="$STATE_ROOT/$cluster_id"
     local cluster_env="$cluster_dir/cluster.env"
@@ -159,10 +322,18 @@ cmd_scale() {
 
     local partition=""
     local notify_email=""
+    local saved_gpu_spec=""
+    local saved_tmp_prefix=""
+    local saved_exclude_nodes=""
+    local saved_use_constraint=""
     while IFS='=' read -r key value; do
         case "$key" in
             PARTITION) partition=$value ;;
             NOTIFY_EMAIL) notify_email=$value ;;
+            GPUS_PER_NODE) saved_gpu_spec=$value ;;
+            TMP_PREFIX) saved_tmp_prefix=$value ;;
+            EXCLUDE_NODES) saved_exclude_nodes=$value ;;
+            USE_CONSTRAINT) saved_use_constraint=$value ;;
         esac
     done < "$cluster_env"
 
@@ -176,41 +347,129 @@ cmd_scale() {
         --cluster-id "$cluster_id" \
         --add-nodes "$add_nodes"
 
-    submit_nodes "$cluster_id" "$partition" "$add_nodes" "$notify_email"
+    local effective_gpu_spec="${cli_gpu_spec:-$saved_gpu_spec}"
+    if [[ -z "$effective_gpu_spec" ]]; then
+        effective_gpu_spec="$(resolve_gpu_spec "$partition" "")"
+    fi
+    local effective_tmp_prefix="${cli_tmp_prefix:-$saved_tmp_prefix}"
+    if [[ -z "$effective_tmp_prefix" ]]; then
+        effective_tmp_prefix="${TMP_PREFIX:-$DEFAULT_TMP_PREFIX}"
+    fi
+    local effective_exclude_nodes="${cli_exclude_nodes:-$saved_exclude_nodes}"
+    if [[ -z "$effective_exclude_nodes" ]]; then
+        effective_exclude_nodes="${EXCLUDE_NODES:-}"
+    fi
+    local effective_use_constraint="${cli_use_constraint:-$saved_use_constraint}"
+    if [[ -z "$effective_use_constraint" ]]; then
+        effective_use_constraint=1
+    fi
+
+    if [[ -n "$cli_gpu_spec" || -n "$cli_tmp_prefix" || -n "$cli_exclude_nodes" || -n "$cli_use_constraint" ]]; then
+        python3 - "$cluster_env" "$effective_gpu_spec" "$effective_tmp_prefix" "$effective_exclude_nodes" "$effective_use_constraint" <<'PY'
+import sys
+from pathlib import Path
+
+cluster_env = Path(sys.argv[1])
+gpu_spec = sys.argv[2]
+tmp_prefix = sys.argv[3]
+exclude_nodes = sys.argv[4]
+use_constraint = sys.argv[5]
+lines = cluster_env.read_text(encoding="utf-8").splitlines()
+updated = []
+gpu_replaced = False
+tmp_replaced = False
+exclude_replaced = False
+constraint_replaced = False
+for line in lines:
+    if line.startswith("GPUS_PER_NODE="):
+        updated.append(f"GPUS_PER_NODE={gpu_spec}")
+        gpu_replaced = True
+    elif line.startswith("TMP_PREFIX="):
+        if not tmp_replaced:
+            updated.append(f"TMP_PREFIX={tmp_prefix}")
+            tmp_replaced = True
+    elif line.startswith("EXCLUDE_NODES="):
+        updated.append(f"EXCLUDE_NODES={exclude_nodes}")
+        exclude_replaced = True
+    elif line.startswith("USE_CONSTRAINT="):
+        updated.append(f"USE_CONSTRAINT={use_constraint}")
+        constraint_replaced = True
+    else:
+        updated.append(line)
+if not gpu_replaced:
+    updated.append(f"GPUS_PER_NODE={gpu_spec}")
+if not tmp_replaced:
+    updated.append(f"TMP_PREFIX={tmp_prefix}")
+if not exclude_replaced:
+    updated.append(f"EXCLUDE_NODES={exclude_nodes}")
+if not constraint_replaced:
+    updated.append(f"USE_CONSTRAINT={use_constraint}")
+cluster_env.write_text("\n".join(updated) + "\n", encoding="utf-8")
+PY
+    fi
+
+    submit_nodes "$cluster_id" "$partition" "$add_nodes" "$notify_email" "$effective_gpu_spec" "$effective_use_constraint" "$effective_tmp_prefix" "$effective_exclude_nodes"
 
     echo "cluster_id=$cluster_id"
     echo "added_nodes=$add_nodes"
 }
 
 cmd_status() {
-    if [[ $# -ne 1 ]]; then
+    if [[ $# -gt 1 ]]; then
         usage
         exit 1
     fi
     require_config
+    local cluster_id
+    cluster_id="$(resolve_cluster_id_arg "${1:-}")"
     python3 "$STATE_HELPER" status \
         --state-root "$STATE_ROOT" \
-        --cluster-id "$1"
+        --cluster-id "$cluster_id" \
+        --auto-cleanup-stale
 }
 
 cmd_down() {
-    if [[ $# -ne 1 ]]; then
+    if [[ $# -gt 1 ]]; then
         usage
         exit 1
     fi
     require_config
+    local cluster_id
+    cluster_id="$(resolve_cluster_id_arg "${1:-}")"
 
-    local cluster_id=$1
     local jobs_file="$STATE_ROOT/$cluster_id/jobs.txt"
+    local cluster_job_ids=()
     if [[ -f "$jobs_file" ]]; then
         while read -r job_id; do
             [[ -n "$job_id" ]] || continue
+            cluster_job_ids+=("$job_id")
             scancel "$job_id"
         done < "$jobs_file"
     fi
     python3 "$STATE_HELPER" cleanup \
         --state-root "$STATE_ROOT" \
         --cluster-id "$cluster_id"
+
+    local job_id=""
+    for job_id in "${cluster_job_ids[@]}"; do
+        rm -f "$LOG_ROOT/job_${job_id}.out"
+    done
+}
+
+cmd_list() {
+    if [[ $# -ne 0 ]]; then
+        usage
+        exit 1
+    fi
+    require_config
+    local cluster_id
+    while read -r cluster_id; do
+        [[ -n "$cluster_id" ]] || continue
+        python3 "$STATE_HELPER" prune-stale \
+            --state-root "$STATE_ROOT" \
+            --cluster-id "$cluster_id" >/dev/null 2>&1 || true
+    done < <(list_clusters)
+    list_clusters
 }
 
 main() {
@@ -227,6 +486,7 @@ main() {
         scale) cmd_scale "$@" ;;
         status) cmd_status "$@" ;;
         down) cmd_down "$@" ;;
+        list) cmd_list "$@" ;;
         *)
             usage
             exit 1
