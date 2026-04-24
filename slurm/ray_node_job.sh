@@ -142,6 +142,18 @@ query_squeue_field() {
     done
 }
 
+is_definitively_unavailable_head_state() {
+    local state=$1
+    case "$state" in
+        MISSING|CANCELLED|FAILED|TIMEOUT|NODE_FAIL|OUT_OF_MEMORY|PREEMPTED|BOOT_FAIL|DEADLINE|STOPPED|SUSPENDED|REVOKED)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 resolve_log_path() {
     local template="${JOB_LOG_PATH_TEMPLATE:-}"
     if [[ -z "$template" ]]; then
@@ -264,6 +276,11 @@ recover_from_stale_head_on_bootstrap() {
 
     if [[ "$head_state" == "RUNNING" || "$head_state" == "COMPLETING" ]]; then
         monitor_log "warn" "recorded head still appears alive; not forcing failover during bootstrap"
+        return 1
+    fi
+
+    if ! is_definitively_unavailable_head_state "$head_state"; then
+        monitor_log "warn" "head state '$head_state' is not a definitive failure; skip bootstrap failover"
         return 1
     fi
 
@@ -419,6 +436,12 @@ monitor_head_failover() {
         fi
         monitor_log "info" "iteration=$iteration epoch=$current_epoch head_job_id=$head_job_id head_state=$state"
         if [[ "$state" == "RUNNING" || "$state" == "COMPLETING" ]]; then
+            sleep "$HEAD_CHECK_INTERVAL_SECONDS"
+            continue
+        fi
+
+        if ! is_definitively_unavailable_head_state "$state"; then
+            monitor_log "warn" "head state '$state' is not a definitive failure; skip failover this round"
             sleep "$HEAD_CHECK_INTERVAL_SECONDS"
             continue
         fi
